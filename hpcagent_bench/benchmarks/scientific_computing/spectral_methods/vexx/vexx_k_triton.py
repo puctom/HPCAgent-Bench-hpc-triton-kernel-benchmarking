@@ -4,16 +4,17 @@
 """Triton vexx_k (QE exact exchange, exx_bp::vexx_bp_k): the per-grid-point work in Triton, FFTs and the small
 projector contractions in torch.
 
-Same structure as ``vexx_k_numpy.py``, with one change of granularity: for a band ii, every partner band jbnd of
-its [jstart, jend] range is independent up to the final accumulation, so the J partners go through each stage
-together as one (J, nrxxs) batch (one batched FFT instead of J single ones):
+A plain (unoptimized) port with the structure and loop granularity of ``vexx_k_numpy.py``: for each band ii, one
+partner band jbnd at a time (one FFT pair per partner, as the reference), each stage below its own kernel or call.
+Batching the partners, and fusing the per-element stages, are left for the optimization stage. The kernels and the
+torch helpers take a leading partner axis of length J; here it is always 1:
   pair density   rhoc[j] = sum_ip conj(phi[j, ip]) * psi_ii[ip] / omega       (Triton)
   augmentation   addusxx_r / addusxx_g on rhoc                                  (torch, batched over j)
   FFT            rhocg = fftn(rhoc)                                             (torch.fft = cuFFT)
   Coulomb        vc[j] = facb * rhocg[j] * occ[j] / nqs                         (Triton)
   newdxx_g / _r / paw_newdxx into deexx[ii]                                     (torch, batched over j)
   FFT            vcr = ifftn(vc)
-  accumulate     result[ii, ip] += sum_j vcr[j] * phi[j, ip], in increasing j   (Triton, the reference's order)
+  accumulate     result[ii, ip] += vcr * phi[jbnd, ip]                           (Triton)
 The setup scatter (psi to the FFT grid) and the final gather back to the G-sphere are Triton kernels too. Band
 bookkeeping (ibands, egrp_pairs, ranges) is small integer data read once on the host.
 
@@ -327,6 +328,42 @@ def vexx_k(
     big_result = torch.zeros((m, n * npol), dtype=cdt, device=dev)
     g_r = triton.cdiv(nrxxs, BLOCK)
 
+    def _pair(jbnd, ii, ikq, ik, all_start_tmp, becpsi_i, qgm_use, sfac_use, eigqts_use, facb):
+        """The reference's per-partner body: band ii against partner band jbnd (J = 1 below)."""
+        J = 1
+        buf0 = jbnd - all_start_tmp + iexx_start - 1
+        phi = exxbuff_w[ikq, buf0 : buf0 + 1, :].contiguous()  # (1, npol * nrxxs)
+        phi_ri = torch.view_as_real(phi)
+        becphi = becxx[ikq, jbnd - 1 : jbnd, :]  # (1, nkb)
+        occ = x_occupation[ik, jbnd - 1 : jbnd] * nqs_inv  # (1,)
+        rhoc = torch.empty((J, nrxxs), dtype=cdt, device=dev)
+        pair_density_kernel[(J, g_r)](
+            phi_ri,
+            torch.view_as_real(temppsic[ii]),
+            torch.view_as_real(rhoc),
+            omega_inv,
+            nrxxs,
+            NPOL=npol,
+            BLOCK=BLOCK,
+        )
+        if okvan and tqr:
+            aug.addusxx_r(rhoc, becphi, becpsi_i)
+        rhocg = torch.fft.fftn(rhoc.view((J,) + grid), dim=(-3, -2, -1)).reshape(J, nrxxs)
+        if okvan and not tqr:
+            aug.addusxx_g(rhocg, nl0, qgm_use, becphi, becpsi_i, eigqts_use, sfac_use)
+        coulomb_kernel[(J, g_r)](torch.view_as_real(rhocg), facb, occ.contiguous(), nrxxs, BLOCK=BLOCK)
+        vc = rhocg
+        if okvan and not tqr:
+            aug.newdxx_g(vc, nl0, qgm_use, becphi, deexx[ii], eigqts_use, sfac_use, omega)
+        vcr = torch.fft.ifftn(vc.view((J,) + grid), dim=(-3, -2, -1)).reshape(J, nrxxs)
+        if okvan and tqr:
+            aug.newdxx_r(vcr, becphi, deexx[ii], omega, nrxxs)
+        if okpaw:
+            aug.paw_newdxx(occ.to(cdt), becphi, becpsi_i, deexx[ii])
+        accumulate_kernel[(npol, g_r)](
+            torch.view_as_real(vcr), phi_ri, torch.view_as_real(result[ii]), J, nrxxs, NPOL=npol, BLOCK=BLOCK
+        )
+
     coulomb_cache = {}
     for iq in range(1, nqs + 1):
         ikq = int(index_xkq_h[iq - 1, current_ik - 1])
@@ -376,46 +413,14 @@ def vexx_k(
                 jend = min(jmax, all_end_tmp)
                 if jend < jstart:
                     continue
-                J = jend - jstart + 1
-                buf0 = jstart - all_start_tmp + iexx_start - 1
-                phi = exxbuff_w[ikq, buf0 : buf0 + J, :].contiguous()  # (J, npol * nrxxs)
-                phi_ri = torch.view_as_real(phi)
-                becphi = becxx[ikq, jstart - 1 : jend, :]  # (J, nkb)
                 becpsi_i = becpsi[ibnd - 1, :]
-                occ = x_occupation[ik, jstart - 1 : jend] * nqs_inv  # (J,)
+                for jbnd in range(jstart, jend + 1):
+                    _pair(jbnd, ii, ikq, ik, all_start_tmp, becpsi_i, qgm_use, sfac_use, eigqts_use, facb)
 
-                rhoc = torch.empty((J, nrxxs), dtype=cdt, device=dev)
-                pair_density_kernel[(J, g_r)](
-                    phi_ri,
-                    torch.view_as_real(temppsic[ii]),
-                    torch.view_as_real(rhoc),
-                    omega_inv,
-                    nrxxs,
-                    NPOL=npol,
-                    BLOCK=BLOCK,
-                )
-                if okvan and tqr:
-                    aug.addusxx_r(rhoc, becphi, becpsi_i)
-                rhocg = torch.fft.fftn(rhoc.view((J,) + grid), dim=(-3, -2, -1)).reshape(J, nrxxs)
-                if okvan and not tqr:
-                    aug.addusxx_g(rhocg, nl0, qgm_use, becphi, becpsi_i, eigqts_use, sfac_use)
-                coulomb_kernel[(J, g_r)](torch.view_as_real(rhocg), facb, occ.contiguous(), nrxxs, BLOCK=BLOCK)
-                vc = rhocg
-                if okvan and not tqr:
-                    aug.newdxx_g(vc, nl0, qgm_use, becphi, deexx[ii], eigqts_use, sfac_use, omega)
-                vcr = torch.fft.ifftn(vc.view((J,) + grid), dim=(-3, -2, -1)).reshape(J, nrxxs)
-                if okvan and tqr:
-                    aug.newdxx_r(vcr, becphi, deexx[ii], omega, nrxxs)
-                if okpaw:
-                    aug.paw_newdxx(occ.to(cdt), becphi, becpsi_i, deexx[ii])
-                accumulate_kernel[(npol, g_r)](
-                    torch.view_as_real(vcr), phi_ri, torch.view_as_real(result[ii]), J, nrxxs, NPOL=npol, BLOCK=BLOCK
-                )
             if negrp > 1:
                 exxbuff_w[ikq] = torch.roll(exxbuff_w[ikq], -1, dims=0)
 
-    # finalize: result(r) -> G-sphere, onto big_result; one batched FFT over all bands and polarizations
-    rg_all = torch.fft.fftn(result.view((my_n * npol,) + grid), dim=(-3, -2, -1)).reshape(my_n, npol, nrxxs)
+    # finalize: result(r) -> G-sphere, onto big_result; one FFT per band (over its polarizations), as the reference
     if okvan:
         d_all = deexx[:, aug.ikb_flat]
         keep = d_all.abs() >= eps_occ
@@ -425,9 +430,10 @@ def vexx_k(
         ibnd = int(ibands_h[eg, ii])
         if ibnd == 0 or ibnd > m:
             continue
+        rg = torch.fft.fftn(result[ii].view((npol,) + grid), dim=(-3, -2, -1)).reshape(npol, nrxxs)
         if n > 0:
             gather_kernel[(npol, triton.cdiv(n, BLOCK))](
-                torch.view_as_real(rg_all[ii]),
+                torch.view_as_real(rg),
                 torch.view_as_real(big_result),
                 nlg,
                 alpha_t,
